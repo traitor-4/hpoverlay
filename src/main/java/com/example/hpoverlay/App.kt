@@ -207,14 +207,13 @@ class HpOverlayService : Service() {
             return
         }
         lastLen = bar.len
-        if (fullWidth in 1 until bar.len) fullWidth = bar.len  // bar longer than calibrated
         if (fullWidth == 0) {
             hpLabel.visibility = View.INVISIBLE
             btn.text = "Tap at full HP"
             return
         }
         val pct = (bar.len * 100 / fullWidth).coerceIn(0, 100)
-        btn.text = "HP $pct%"
+        btn.text = "HP $pct% (${bar.len}/$fullWidth) tap=reset"
         hpLabel.text = "$pct%"
         hpLabel.visibility = View.VISIBLE
         // Centre the text on the bar (bar's left edge is fixed, so use full width)
@@ -244,7 +243,7 @@ class HpOverlayService : Service() {
                     if (run == 0) start = x
                     run += 1 + gap; gap = 0
                     if (run > bestLen) { bestLen = run; bestX = start; bestY = y }
-                } else if (run > 0 && ++gap > 2) { run = 0; gap = 0 }
+                } else if (run > 0 && ++gap > 8) { run = 0; gap = 0 }
             }
         }
         return if (bestLen >= 20) Bar(bestLen, bestX, bestY) else null
