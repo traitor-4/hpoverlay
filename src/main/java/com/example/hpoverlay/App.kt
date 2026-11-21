@@ -1,3 +1,4 @@
+package com.example.hpoverlay
 
 import android.app.*
 import android.content.Context
@@ -17,8 +18,11 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
+import android.util.Log
 import android.view.WindowManager
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 /** Open once: grants permissions and starts. Open again while running: stops. */
 class MainActivity : Activity() {
@@ -26,6 +30,20 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try { begin() } catch (t: Throwable) { showError(t) }
+    }
+
+    private fun showError(t: Throwable) {
+        val tv = TextView(this).apply {
+            text = "ERROR (send a screenshot of this):\n\n" + Log.getStackTraceString(t)
+            textSize = 12f
+            setTextIsSelectable(true)
+            setPadding(24, 64, 24, 24)
+        }
+        setContentView(ScrollView(this).apply { addView(tv) })
+    }
+
+    private fun begin() {
         if (HpOverlayService.running) {
             stopService(Intent(this, HpOverlayService::class.java))
             finish(); return
@@ -40,12 +58,14 @@ class MainActivity : Activity() {
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
-        if (req == REQ && res == RESULT_OK && data != null) {
-            startForegroundService(
-                Intent(this, HpOverlayService::class.java)
-                    .putExtra("code", res).putExtra("data", data))
-        }
-        finish()
+        try {
+            if (req == REQ && res == RESULT_OK && data != null) {
+                startForegroundService(
+                    Intent(this, HpOverlayService::class.java)
+                        .putExtra("code", res).putExtra("data", data))
+            }
+            finish()
+        } catch (t: Throwable) { showError(t) }
     }
 }
 
@@ -79,6 +99,15 @@ class HpOverlayService : Service() {
     override fun onBind(i: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return try { doStart(intent) } catch (t: Throwable) {
+            Toast.makeText(this, "Error: " + t.javaClass.simpleName + ": " + t.message,
+                Toast.LENGTH_LONG).show()
+            stopSelf()
+            START_NOT_STICKY
+        }
+    }
+
+    private fun doStart(intent: Intent?): Int {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("hp", "HP overlay", NotificationManager.IMPORTANCE_LOW))
         val n = Notification.Builder(this, "hp")
