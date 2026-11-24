@@ -3,7 +3,12 @@ package com.example.hpoverlay
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.os.SystemClock
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -77,7 +82,7 @@ class HpOverlayService : Service() {
     // Search box (fractions of screen) where YOUR hero's HP bar appears.
     private val REGION = floatArrayOf(0.35f, 0.25f, 0.65f, 0.55f) // l, t, r, b
     // Pixel test for the filled (green) part of the bar.
-    private fun isFill(r: Int, g: Int, b: Int) = g > 180 && r < 130 && b < 130
+    private fun isFill(r: Int, g: Int, b: Int) = g > 120 && g > r + 60 && g > b + 60
     private val INTERVAL_MS = 300L
     // --------------------------------------------------------------------
 
@@ -94,6 +99,23 @@ class HpOverlayService : Service() {
     private var capH = 0
     private var fullWidth = 0   // bar length in px at 100% HP
     private var lastLen = 0
+
+    // ---- Low-HP kill counter ------------------------------------------
+    // Box (fractions of screen) around YOUR kills number in the top-right
+    // K / D / A row (the first number, next to the crossed swords).
+    private val KILL_REGION = floatArrayOf(0.82f, 0.03f, 0.845f, 0.082f)
+    private val LOW_HP_PCT = 10          // counts kills made below this HP %
+    private val LOW_HP_WINDOW_MS = 5000L // kill counts if HP was low within this time
+    private val recognizer by lazy {
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    }
+    private var lowKills = 0
+    private var lowHpUntil = 0L
+    private var lastKills = -1
+    private var pendingKills = -1
+    private var pendingCount = 0
+    private var lastOcrAt = 0L
+    private var ocrBusy = false
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onBind(i: Intent?) = null
@@ -161,6 +183,7 @@ class HpOverlayService : Service() {
             setBackgroundColor(0x99000000.toInt())
             setPadding(16, 6, 16, 6)
             setOnClickListener { if (lastLen > 0) fullWidth = lastLen }
+            setOnLongClickListener { lowKills = 0; true }  // long-press = reset counter
         }
         val blp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -193,33 +216,101 @@ class HpOverlayService : Service() {
         override fun run() {
             try {
                 ensureCapture()
-                reader?.acquireLatestImage()?.use { img -> update(findBar(img)) }
+                reader?.acquireLatestImage()?.use { img -> update(findBar(img)); readKills(img) }
             } catch (e: Exception) { /* skip this frame */ }
             handler.postDelayed(this, INTERVAL_MS)
         }
     }
 
+    private var lastBarX = -1
+    private var lastBarY = -1
+
+    private fun showLabel(text: String) {
+        hpLabel.text = text
+        hpLabel.visibility = View.VISIBLE
+        // Centre the text on the bar (bar's left edge is fixed, so use full width)
+        hpLp.x = lastBarX + fullWidth / 2 - hpLabel.width / 2
+        hpLp.y = lastBarY - hpLabel.height / 2
+        wm.updateViewLayout(hpLabel, hpLp)
+    }
+
     private fun update(bar: Bar?) {
         if (bar == null) {
             lastLen = 0
-            hpLabel.visibility = View.INVISIBLE
-            btn.text = "HP bar not found"
+            if (fullWidth > 0 && lastBarX >= 0) {
+                // Bar was seen before but no fill found: HP is almost empty
+                lowHpUntil = SystemClock.uptimeMillis() + LOW_HP_WINDOW_MS
+                setStatus("HP <5% (fill not found)")
+                showLabel("<5%")
+            } else {
+                hpLabel.visibility = View.INVISIBLE
+                setStatus("HP bar not found")
+            }
             return
         }
         lastLen = bar.len
+        lastBarX = bar.x
+        lastBarY = bar.y
         if (fullWidth == 0) {
             hpLabel.visibility = View.INVISIBLE
-            btn.text = "Tap at full HP"
+            setStatus("Tap at full HP")
             return
         }
         val pct = (bar.len * 100 / fullWidth).coerceIn(0, 100)
-        btn.text = "HP $pct% (${bar.len}/$fullWidth) tap=reset"
-        hpLabel.text = "$pct%"
-        hpLabel.visibility = View.VISIBLE
-        // Centre the text on the bar (bar's left edge is fixed, so use full width)
-        hpLp.x = bar.x + fullWidth / 2 - hpLabel.width / 2
-        hpLp.y = bar.y - hpLabel.height / 2
-        wm.updateViewLayout(hpLabel, hpLp)
+        if (pct < LOW_HP_PCT) lowHpUntil = SystemClock.uptimeMillis() + LOW_HP_WINDOW_MS
+        setStatus("HP $pct% (${bar.len}/$fullWidth)")
+        showLabel("$pct%")
+    }
+
+    private fun setStatus(text: String) {
+        btn.text = "$text | Low-HP kills: $lowKills"
+    }
+
+    /** Reads the kills number (about once a second) with on-device text recognition. */
+    private fun readKills(img: Image) {
+        val now = SystemClock.uptimeMillis()
+        if (ocrBusy || now - lastOcrAt < 800) return
+        lastOcrAt = now
+        val plane = img.planes[0]
+        val buf = plane.buffer
+        val rs = plane.rowStride
+        val x0 = (img.width * KILL_REGION[0]).toInt()
+        val y0 = (img.height * KILL_REGION[1]).toInt()
+        val w = (img.width * KILL_REGION[2]).toInt() - x0
+        val h = (img.height * KILL_REGION[3]).toInt() - y0
+        if (w <= 0 || h <= 0) return
+        val px = IntArray(w * h)
+        for (y in 0 until h) for (x in 0 until w) {
+            val o = (y0 + y) * rs + (x0 + x) * 4
+            px[y * w + x] = Color.rgb(
+                buf.get(o).toInt() and 0xFF,
+                buf.get(o + 1).toInt() and 0xFF,
+                buf.get(o + 2).toInt() and 0xFF)
+        }
+        val small = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+        val big = Bitmap.createScaledBitmap(small, w * 5, h * 5, true)
+        ocrBusy = true
+        recognizer.process(InputImage.fromBitmap(big, 0))
+            .addOnSuccessListener { res ->
+                ocrBusy = false
+                val n = Regex("\\d+").find(res.text)?.value?.toIntOrNull()
+                if (n != null && n in 0..99) onKills(n)
+            }
+            .addOnFailureListener { ocrBusy = false }
+    }
+
+    private fun onKills(n: Int) {
+        // accept a number only after two identical readings in a row
+        if (n == pendingKills) pendingCount++ else { pendingKills = n; pendingCount = 1 }
+        if (pendingCount < 2) return
+        if (lastKills < 0) { lastKills = n; return }
+        if (n < lastKills) {            // kills dropped = a new match started
+            lowKills = 0; lastKills = n; return
+        }
+        if (n > lastKills) {
+            if (SystemClock.uptimeMillis() <= lowHpUntil) lowKills += n - lastKills
+            lastKills = n
+        }
     }
 
     /** Finds the longest horizontal run of fill-coloured pixels inside REGION. */
@@ -246,7 +337,7 @@ class HpOverlayService : Service() {
                 } else if (run > 0 && ++gap > 8) { run = 0; gap = 0 }
             }
         }
-        return if (bestLen >= 20) Bar(bestLen, bestX, bestY) else null
+        return if (bestLen >= 5) Bar(bestLen, bestX, bestY) else null
     }
 
     override fun onDestroy() {
