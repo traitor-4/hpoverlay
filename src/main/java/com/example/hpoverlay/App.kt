@@ -114,8 +114,12 @@ class HpOverlayService : Service() {
     private var lastKills = -1
     private var pendingKills = -1
     private var pendingCount = 0
+    private var lowerCount = 0
     private var lastOcrAt = 0L
     private var ocrBusy = false
+    private var lastKillsSeenAt = 0L
+    private var inMatch = false
+    private val MATCH_TIMEOUT_MS = 8000L   // no kills number for this long = match over
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onBind(i: Intent?) = null
@@ -218,6 +222,7 @@ class HpOverlayService : Service() {
                 ensureCapture()
                 reader?.acquireLatestImage()?.use { img -> update(findBar(img)); readKills(img) }
             } catch (e: Exception) { /* skip this frame */ }
+            checkMatchOver()
             handler.postDelayed(this, INTERVAL_MS)
         }
     }
@@ -235,6 +240,12 @@ class HpOverlayService : Service() {
     }
 
     private fun update(bar: Bar?) {
+        if (!inMatch) {                 // lobby / menus: show nothing
+            lastLen = 0
+            hpLabel.visibility = View.INVISIBLE
+            setStatus("Waiting for match")
+            return
+        }
         if (bar == null) {
             lastLen = 0
             if (fullWidth > 0 && lastBarX >= 0) {
@@ -262,8 +273,25 @@ class HpOverlayService : Service() {
         showLabel("$pct%")
     }
 
+    /** If the kills number has not been readable for a while, the match is over. */
+    private fun checkMatchOver() {
+        if (inMatch && SystemClock.uptimeMillis() - lastKillsSeenAt > MATCH_TIMEOUT_MS) {
+            inMatch = false
+            lowKills = 0
+            lastKills = -1
+            pendingKills = -1
+            pendingCount = 0
+            lastBarX = -1
+            lastBarY = -1
+            lowHpUntil = 0L
+            lastLen = 0
+            hpLabel.visibility = View.INVISIBLE
+            setStatus("Waiting for match")
+        }
+    }
+
     private fun setStatus(text: String) {
-        btn.text = "$text | Low-HP kills: $lowKills"
+        btn.text = "$text | Low-HP kills: $lowKills | K:$lastKills"
     }
 
     /** Reads the kills number (about once a second) with on-device text recognition. */
@@ -282,10 +310,11 @@ class HpOverlayService : Service() {
         val px = IntArray(w * h)
         for (y in 0 until h) for (x in 0 until w) {
             val o = (y0 + y) * rs + (x0 + x) * 4
-            px[y * w + x] = Color.rgb(
-                buf.get(o).toInt() and 0xFF,
-                buf.get(o + 1).toInt() and 0xFF,
-                buf.get(o + 2).toInt() and 0xFF)
+            val r = buf.get(o).toInt() and 0xFF
+            val g = buf.get(o + 1).toInt() and 0xFF
+            val b = buf.get(o + 2).toInt() and 0xFF
+            // bright (white) digit pixels -> black, everything else -> white
+            px[y * w + x] = if ((r * 3 + g * 6 + b) / 10 > 170) Color.BLACK else Color.WHITE
         }
         val small = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
         val big = Bitmap.createScaledBitmap(small, w * 5, h * 5, true)
@@ -294,7 +323,11 @@ class HpOverlayService : Service() {
             .addOnSuccessListener { res ->
                 ocrBusy = false
                 val n = Regex("\\d+").find(res.text)?.value?.toIntOrNull()
-                if (n != null && n in 0..99) onKills(n)
+                if (n != null && n in 0..99) {
+                    lastKillsSeenAt = SystemClock.uptimeMillis()
+                    inMatch = true
+                    onKills(n)
+                }
             }
             .addOnFailureListener { ocrBusy = false }
     }
@@ -304,9 +337,13 @@ class HpOverlayService : Service() {
         if (n == pendingKills) pendingCount++ else { pendingKills = n; pendingCount = 1 }
         if (pendingCount < 2) return
         if (lastKills < 0) { lastKills = n; return }
-        if (n < lastKills) {            // kills dropped = a new match started
-            lowKills = 0; lastKills = n; return
+        if (n < lastKills) {
+            // Probably a misread (e.g. 6 read as 0). Never reset the counter here;
+            // only accept the lower number if it keeps showing up.
+            if (++lowerCount >= 4) { lastKills = n; lowerCount = 0 }
+            return
         }
+        lowerCount = 0
         if (n > lastKills) {
             if (SystemClock.uptimeMillis() <= lowHpUntil) lowKills += n - lastKills
             lastKills = n
