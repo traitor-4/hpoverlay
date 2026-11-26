@@ -80,9 +80,10 @@ class HpOverlayService : Service() {
 
     // ---- TUNE THESE ----------------------------------------------------
     // Search box (fractions of screen) where YOUR hero's HP bar appears.
-    private val REGION = floatArrayOf(0.35f, 0.25f, 0.65f, 0.55f) // l, t, r, b
+    private val REGION = floatArrayOf(0.44f, 0.33f, 0.58f, 0.44f) // l, t, r, b
     // Pixel test for the filled (green) part of the bar.
-    private fun isFill(r: Int, g: Int, b: Int) = g > 120 && g > r + 60 && g > b + 60
+    private fun isFill(r: Int, g: Int, b: Int) =
+        g > 140 && g > r + 70 && g > b + 70 && Math.abs(r - b) < 50
     private val INTERVAL_MS = 300L
     // --------------------------------------------------------------------
 
@@ -240,6 +241,11 @@ class HpOverlayService : Service() {
     }
 
     private fun update(bar: Bar?) {
+        // A visible HP bar also proves we are in a match
+        if (bar != null && bar.len >= 20) {
+            lastKillsSeenAt = SystemClock.uptimeMillis()
+            inMatch = true
+        }
         if (!inMatch) {                 // lobby / menus: show nothing
             lastLen = 0
             hpLabel.visibility = View.INVISIBLE
@@ -307,29 +313,57 @@ class HpOverlayService : Service() {
         val w = (img.width * KILL_REGION[2]).toInt() - x0
         val h = (img.height * KILL_REGION[3]).toInt() - y0
         if (w <= 0 || h <= 0) return
-        val px = IntArray(w * h)
+        val raw = IntArray(w * h)
+        val bin = IntArray(w * h)
         for (y in 0 until h) for (x in 0 until w) {
             val o = (y0 + y) * rs + (x0 + x) * 4
             val r = buf.get(o).toInt() and 0xFF
             val g = buf.get(o + 1).toInt() and 0xFF
             val b = buf.get(o + 2).toInt() and 0xFF
+            raw[y * w + x] = Color.rgb(r, g, b)
             // bright (white) digit pixels -> black, everything else -> white
-            px[y * w + x] = if ((r * 3 + g * 6 + b) / 10 > 170) Color.BLACK else Color.WHITE
+            bin[y * w + x] = if ((r * 3 + g * 6 + b) / 10 > 170) Color.BLACK else Color.WHITE
         }
-        val small = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
-        val big = Bitmap.createScaledBitmap(small, w * 5, h * 5, true)
+        val binBmp = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(bin, w, h, Bitmap.Config.ARGB_8888), w * 5, h * 5, true)
+        val rawBmp = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(raw, w, h, Bitmap.Config.ARGB_8888), w * 5, h * 5, true)
         ocrBusy = true
-        recognizer.process(InputImage.fromBitmap(big, 0))
+        // Try the high-contrast image first; if no number is found, try the original.
+        recognizer.process(InputImage.fromBitmap(binBmp, 0))
             .addOnSuccessListener { res ->
-                ocrBusy = false
-                val n = Regex("\\d+").find(res.text)?.value?.toIntOrNull()
-                if (n != null && n in 0..99) {
-                    lastKillsSeenAt = SystemClock.uptimeMillis()
-                    inMatch = true
-                    onKills(n)
-                }
+                val n = parseKills(res.text)
+                if (n != null) { ocrBusy = false; gotKills(n) }
+                else recognizer.process(InputImage.fromBitmap(rawBmp, 0))
+                    .addOnSuccessListener { r2 ->
+                        ocrBusy = false
+                        parseKills(r2.text)?.let { gotKills(it) }
+                    }
+                    .addOnFailureListener { ocrBusy = false }
             }
             .addOnFailureListener { ocrBusy = false }
+    }
+
+    /** Turns look-alike letters into digits (a lone "1" is often read as I, l or |). */
+    private fun parseKills(text: String): Int? {
+        val t = text.map {
+            when (it) {
+                'I', 'l', '|', '!' -> '1'
+                'O', 'o', 'D' -> '0'
+                'S' -> '5'
+                'B' -> '8'
+                'g' -> '9'
+                else -> it
+            }
+        }.joinToString("")
+        val n = Regex("\\d+").find(t)?.value?.toIntOrNull() ?: return null
+        return if (n in 0..99) n else null
+    }
+
+    private fun gotKills(n: Int) {
+        lastKillsSeenAt = SystemClock.uptimeMillis()
+        inMatch = true
+        onKills(n)
     }
 
     private fun onKills(n: Int) {
@@ -360,6 +394,7 @@ class HpOverlayService : Service() {
         val x1 = (img.width * REGION[2]).toInt()
         val y1 = (img.height * REGION[3]).toInt()
         var bestLen = 0; var bestX = 0; var bestY = 0
+        var bestScore = Int.MIN_VALUE
         for (y in y0 until y1 step 2) {
             var run = 0; var gap = 0; var start = 0
             for (x in x0 until x1) {
@@ -370,7 +405,13 @@ class HpOverlayService : Service() {
                 if (isFill(r, g, b)) {
                     if (run == 0) start = x
                     run += 1 + gap; gap = 0
-                    if (run > bestLen) { bestLen = run; bestX = start; bestY = y }
+                    // prefer the bar near where we last saw it (ignores grass, minions, monsters)
+                    val dist = if (lastBarX >= 0)
+                        Math.abs(start - lastBarX) + Math.abs(y - lastBarY) else 0
+                    val score = run - 2 * dist
+                    if (score > bestScore) {
+                        bestScore = score; bestLen = run; bestX = start; bestY = y
+                    }
                 } else if (run > 0 && ++gap > 8) { run = 0; gap = 0 }
             }
         }
