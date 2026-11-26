@@ -116,11 +116,14 @@ class HpOverlayService : Service() {
     private var pendingKills = -1
     private var pendingCount = 0
     private var lowerCount = 0
+    private var jumpCount = 0
+    private var lastPct = 100
+    private var lastPctAt = 0L
     private var lastOcrAt = 0L
     private var ocrBusy = false
     private var lastKillsSeenAt = 0L
     private var inMatch = false
-    private val MATCH_TIMEOUT_MS = 8000L   // no kills number for this long = match over
+    private val MATCH_TIMEOUT_MS = 90000L   // no kills number for this long = match over
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onBind(i: Intent?) = null
@@ -254,9 +257,10 @@ class HpOverlayService : Service() {
         }
         if (bar == null) {
             lastLen = 0
-            if (fullWidth > 0 && lastBarX >= 0) {
-                // Bar was seen before but no fill found: HP is almost empty
-                lowHpUntil = SystemClock.uptimeMillis() + LOW_HP_WINDOW_MS
+            val now = SystemClock.uptimeMillis()
+            if (fullWidth > 0 && lastBarX >= 0 && lastPct <= 15 && now - lastPctAt < 3000) {
+                // HP was already low a moment ago and the fill vanished: almost empty
+                lowHpUntil = now + LOW_HP_WINDOW_MS
                 setStatus("HP <5% (fill not found)")
                 showLabel("<5%")
             } else {
@@ -274,6 +278,8 @@ class HpOverlayService : Service() {
             return
         }
         val pct = (bar.len * 100 / fullWidth).coerceIn(0, 100)
+        lastPct = pct
+        lastPctAt = SystemClock.uptimeMillis()
         if (pct < LOW_HP_PCT) lowHpUntil = SystemClock.uptimeMillis() + LOW_HP_WINDOW_MS
         setStatus("HP $pct% (${bar.len}/$fullWidth)")
         showLabel("$pct%")
@@ -287,6 +293,9 @@ class HpOverlayService : Service() {
             lastKills = -1
             pendingKills = -1
             pendingCount = 0
+            lowerCount = 0
+            jumpCount = 0
+            lastPct = 100
             lastBarX = -1
             lastBarY = -1
             lowHpUntil = 0L
@@ -367,21 +376,27 @@ class HpOverlayService : Service() {
     }
 
     private fun onKills(n: Int) {
-        // accept a number only after two identical readings in a row
+        // accept a number only after three identical readings in a row
         if (n == pendingKills) pendingCount++ else { pendingKills = n; pendingCount = 1 }
-        if (pendingCount < 2) return
+        if (pendingCount < 3) return
         if (lastKills < 0) { lastKills = n; return }
+        if (n == lastKills) { lowerCount = 0; jumpCount = 0; return }
         if (n < lastKills) {
-            // Probably a misread (e.g. 6 read as 0). Never reset the counter here;
+            // Probably a misread. Never reset the counter here;
             // only accept the lower number if it keeps showing up.
             if (++lowerCount >= 4) { lastKills = n; lowerCount = 0 }
             return
         }
         lowerCount = 0
-        if (n > lastKills) {
-            if (SystemClock.uptimeMillis() <= lowHpUntil) lowKills += n - lastKills
-            lastKills = n
+        val gain = n - lastKills
+        if (gain > 2) {
+            // Too big to be real kills (misread like 6 -> 9): resync only if it persists
+            if (++jumpCount >= 5) { lastKills = n; jumpCount = 0 }
+            return
         }
+        jumpCount = 0
+        if (SystemClock.uptimeMillis() <= lowHpUntil) lowKills += gain
+        lastKills = n
     }
 
     /** Finds the longest horizontal run of fill-coloured pixels inside REGION. */
